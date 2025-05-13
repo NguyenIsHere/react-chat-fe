@@ -29,16 +29,18 @@ function PrivateChatWindow ({ selectedUser, onMessageReceived }) {
   }, [chatMessages, scrollToBottom])
 
   const normalizeMessage = msg => {
+    // Đảm bảo messageId luôn có mặt nếu là tin từ server hoặc optimistic đã có messageId được gán
+    // tempId là của client-side optimistic
     return {
-      id: msg.id, // ID từ MongoDB (nếu là tin nhắn từ lịch sử hoặc đã được server xử lý)
-      messageId: msg.messageId, // ID duy nhất của tin nhắn (UUID từ producer)
-      tempId: msg.tempId, // ID tạm thời của client cho optimistic update
+      id: msg.id,
+      messageId: msg.messageId, // Rất quan trọng cho việc khớp tin nhắn
+      tempId: msg.tempId,
       sender: msg.sender || msg.senderPhoneNumber,
       recipientPhoneNumber: msg.recipientPhoneNumber,
       content: msg.content,
       timeStamp: msg.timeStamp || msg.timestamp,
       messageType: msg.messageType || 'PRIVATE',
-      isOptimistic: !!msg.isOptimistic // Chuyển về boolean
+      isOptimistic: !!msg.isOptimistic
     }
   }
 
@@ -58,9 +60,7 @@ function PrivateChatWindow ({ selectedUser, onMessageReceived }) {
           setHistoryError('Could not load chat history.')
           setChatMessages([])
         })
-        .finally(() => {
-          setIsLoadingHistory(false)
-        })
+        .finally(() => setIsLoadingHistory(false))
     } else {
       setChatMessages([])
     }
@@ -69,10 +69,7 @@ function PrivateChatWindow ({ selectedUser, onMessageReceived }) {
   useEffect(() => {
     if (onMessageReceived && selectedUser && currentUser?.phoneNumber) {
       const stompMessage = normalizeMessage(onMessageReceived)
-      console.log(
-        '[STOMP_MSG] PrivateChatWindow received STOMP message:',
-        stompMessage
-      )
+      console.log('[STOMP_MSG] Received in PrivateChatWindow:', stompMessage)
 
       const {
         sender,
@@ -89,61 +86,71 @@ function PrivateChatWindow ({ selectedUser, onMessageReceived }) {
 
       if (isForThisChat) {
         setChatMessages(prevMessages => {
-          // 1. Nếu tin nhắn từ STOMP có messageId, cố gắng tìm và thay thế tin nhắn optimistic
-          //    có cùng nội dung và người gửi (hoặc dựa vào tempId nếu có)
-          if (stompMsgMessageId && sender === currentPhoneNumber) {
-            const optimisticMsgIndex = prevMessages.findIndex(
-              pm =>
-                pm.isOptimistic &&
-                pm.sender === sender &&
-                pm.recipientPhoneNumber === msgRecipient && // Thêm điều kiện người nhận cho optimistic
-                pm.content === stompMessage.content
-              // Không nên so sánh timeStamp quá chặt chẽ ở đây
-            )
+          // Tìm xem có tin nhắn optimistic nào cần được thay thế không
+          // Tin nhắn optimistic sẽ có isOptimistic: true và cùng content, sender, recipient
+          // Hoặc tốt hơn, nếu tin nhắn optimistic có tempId và server gửi lại messageId tương ứng với tempId đó
+          // (điều này đòi hỏi backend phải biết về tempId, hiện tại chúng ta không làm vậy)
+          // Hiện tại, chúng ta sẽ dựa vào messageId mà backend gửi về.
+          // Nếu tin nhắn từ STOMP có messageId và là của currentUser gửi đi,
+          // chúng ta sẽ cố gắng tìm và thay thế một tin nhắn optimistic.
 
-            if (optimisticMsgIndex !== -1) {
-              const updatedMessages = [...prevMessages]
-              updatedMessages[optimisticMsgIndex] = {
-                ...stompMessage,
-                isOptimistic: false
-              } // Thay thế bằng tin nhắn server
+          let isReplaced = false
+          const updatedMessages = prevMessages.map(pm => {
+            // Nếu tin nhắn từ STOMP là của currentUser gửi đi VÀ nó có messageId
+            // VÀ tin nhắn pm trong state là optimistic VÀ có cùng nội dung
+            // (Cách so sánh content này không hoàn hảo, nhưng là một heuristic)
+            if (
+              sender === currentPhoneNumber &&
+              stompMsgMessageId &&
+              pm.isOptimistic &&
+              pm.sender === sender &&
+              pm.recipientPhoneNumber === msgRecipient &&
+              pm.content === stompMessage.content
+            ) {
               console.log(
-                '[STOMP_MSG] Replaced optimistic message with server version:',
-                updatedMessages[optimisticMsgIndex]
+                '[STOMP_MSG] Replacing optimistic message with server version (ID: ' +
+                  stompMsgMessageId +
+                  ')'
               )
-              return updatedMessages
+              isReplaced = true
+              return { ...stompMessage, isOptimistic: false } // Thay thế
+            }
+            // Nếu tin nhắn từ STOMP có messageId và đã tồn tại trong state (cũng có messageId)
+            if (
+              stompMsgMessageId &&
+              pm.messageId &&
+              pm.messageId === stompMsgMessageId
+            ) {
+              console.log(
+                '[STOMP_MSG] Message with ID ' +
+                  stompMsgMessageId +
+                  ' already exists. Updating if necessary.'
+              )
+              isReplaced = true // Coi như đã được xử lý/thay thế
+              return { ...stompMessage, isOptimistic: false } // Cập nhật bằng bản từ server
+            }
+            return pm
+          })
+
+          if (!isReplaced) {
+            // Nếu không có gì được thay thế, và tin nhắn này chưa tồn tại (dựa trên messageId)
+            // thì thêm nó vào.
+            const alreadyExistsById =
+              stompMsgMessageId &&
+              prevMessages.some(pm => pm.messageId === stompMsgMessageId)
+            if (!alreadyExistsById) {
+              console.log('[STOMP_MSG] Adding new STOMP message:', stompMessage)
+              return [
+                ...updatedMessages,
+                { ...stompMessage, isOptimistic: false }
+              ]
             }
           }
-
-          // 2. Nếu không phải là thay thế optimistic, kiểm tra xem tin nhắn đã tồn tại chưa (dựa trên messageId)
-          // Điều này quan trọng để tránh trùng lặp nếu tin nhắn đến từ thiết bị khác của cùng user
-          // hoặc nếu STOMP gửi lại vì lý do nào đó.
-          const messageAlreadyExists = prevMessages.some(
-            pm => pm.messageId && pm.messageId === stompMsgMessageId
-          )
-
-          if (!messageAlreadyExists) {
-            console.log(
-              '[STOMP_MSG] Adding new STOMP message to chatMessages:',
-              stompMessage
-            )
-            return [...prevMessages, { ...stompMessage, isOptimistic: false }]
-          } else {
-            console.log(
-              '[STOMP_MSG] STOMP message with ID',
-              stompMsgMessageId,
-              'already exists. Not adding again.'
-            )
-            return prevMessages // Đã tồn tại, không làm gì cả
-          }
+          return updatedMessages // Trả về danh sách đã được cập nhật hoặc không thay đổi
         })
-      } else {
-        console.log(
-          '[STOMP_MSG] STOMP Message is not for the current private chat window.'
-        )
       }
     }
-  }, [onMessageReceived, currentUser, selectedUser]) // Bỏ chatMessages khỏi dependency array
+  }, [onMessageReceived, currentUser, selectedUser]) // Bỏ chatMessages khỏi dependencies
 
   if (!selectedUser) {
     return (
@@ -160,11 +167,14 @@ function PrivateChatWindow ({ selectedUser, onMessageReceived }) {
       selectedUser?.phoneNumber &&
       currentUser?.phoneNumber
     ) {
+      // Backend sẽ tạo messageId (UUID). Frontend không cần tạo messageId ở đây nữa.
+      // tempId vẫn hữu ích cho việc tìm và thay thế optimistic message.
       const clientTempId = `optimistic-${Date.now()}-${Math.random()
         .toString(36)
         .substr(2, 9)}`
+
       const optimisticMessage = normalizeMessage({
-        tempId: clientTempId, // ID tạm thời cho client-side để có thể tìm và thay thế
+        tempId: clientTempId,
         sender: currentUser.phoneNumber,
         recipientPhoneNumber: selectedUser.phoneNumber,
         content: messageInput,
@@ -178,6 +188,8 @@ function PrivateChatWindow ({ selectedUser, onMessageReceived }) {
         optimisticMessage
       )
       setChatMessages(prevMessages => [...prevMessages, optimisticMessage])
+
+      // Gửi tin nhắn lên backend (backend sẽ tạo messageId thật)
       sendPrivateMessage(selectedUser.phoneNumber, messageInput)
       setMessageInput('')
     }
@@ -199,13 +211,17 @@ function PrivateChatWindow ({ selectedUser, onMessageReceived }) {
         }
       >
         {chatMessages.map(msg => {
+          // Điều kiện để xác định tin nhắn là của người dùng hiện tại
           const isSentByCurrentUser =
             msg.sender &&
             currentUser?.phoneNumber &&
             msg.sender === currentUser.phoneNumber
+          console.log(
+            `[RENDER_MSG] Content: "${msg.content}", Sender: ${msg.sender}, CurrentUser: ${currentUser?.phoneNumber}, isSent: ${isSentByCurrentUser}`
+          )
           return (
             <div
-              key={msg.id || msg.messageId || msg.tempId} // Ưu tiên id từ DB, rồi messageId, rồi tempId
+              key={msg.id || msg.messageId || msg.tempId} // Key ưu tiên
               className={`message ${isSentByCurrentUser ? 'sent' : 'received'}`}
               style={
                 msg.isOptimistic ? { opacity: 0.6, fontStyle: 'italic' } : {}
@@ -214,10 +230,12 @@ function PrivateChatWindow ({ selectedUser, onMessageReceived }) {
               <strong>
                 {isSentByCurrentUser
                   ? 'You'
-                  : selectedUser.phoneNumber === msg.sender
+                  : // Nếu là tin nhắn nhận được, hiển thị username của người đang chat cùng (selectedUser)
+                  // Hoặc nếu vì lý do nào đó sender không phải selectedUser, thì hiển thị sender (SĐT)
+                  selectedUser.phoneNumber === msg.sender
                   ? selectedUser.username
-                  : msg.sender}
-                :&nbsp; {/* Thêm non-breaking space */}
+                  : `User(${msg.sender.slice(-4)})`}
+                :&nbsp;
               </strong>
               {msg.content}
               <span
@@ -232,7 +250,6 @@ function PrivateChatWindow ({ selectedUser, onMessageReceived }) {
         <div ref={messagesEndRef} />
       </div>
       <form onSubmit={handleSendMessage}>
-        {/* ... input và button ... */}
         <input
           type='text'
           value={messageInput}
